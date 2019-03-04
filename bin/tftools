@@ -1,0 +1,106 @@
+#!/usr/bin/env python3
+
+import argparse
+import fnmatch
+import json
+import subprocess
+import sys
+import re
+import shlex
+
+assert sys.version_info >= (3, 5)
+
+def terraform_state_pull():
+    status = subprocess.run(['terraform', 'state', 'pull'],
+            check=True, capture_output=True)
+    return status.stdout
+
+def terraform_state():
+    return json.loads(terraform_state_pull())
+
+def module_prefix(module_path):
+    """Return the 'module path' for a resource address from the 'path'
+    array in the state JSON.
+    """
+    assert module_path[0] == 'root'
+    if len(module_path) == 1:
+        return ''
+    segments = []
+    for name in module_path[1:]:
+        segments.append('module')
+        segments.append(name)
+    segments.append('')
+    return '.'.join(segments)
+
+index_pattern = re.compile(r'\.(\d+)$')
+
+def translate_index(address):
+    """Translate the '.N' style addressing used by the state JSON to
+    the '[N]' style required by the command line.
+    """
+    return index_pattern.sub(r'[\1]', address)
+
+def resources(state):
+    """Iterate all resources in the Terraform state."""
+    for module in state['modules']:
+        prefix = module_prefix(module['path'])
+        for key, resource in module['resources'].items():
+            yield (prefix + translate_index(key), resource)
+
+def print_import_commands(state, pattern):
+    for key, resource in resources(state):
+        if pattern.match(key):
+            print('terraform import', shlex.quote(key),
+                    shlex.quote(resource['primary']['id']))
+
+def print_state_rm_commands(state, pattern):
+    addresses = [shlex.quote(addr) for addr, res in resources(state)
+                 if pattern.match(addr)]
+    if addresses:
+        print('terraform', 'state', 'rm', *addresses)
+
+def do_export(args):
+    pattern = re.compile(fnmatch.translate(args.pattern))
+    try:
+        state = terraform_state()
+    except:
+        print('failed to read Terraform state', file=sys.stderr)
+        sys.exit(1)
+    else:
+        print_import_commands(state, pattern)
+
+def do_forget(args):
+    pattern = re.compile(fnmatch.translate(args.pattern))
+    try:
+        state = terraform_state()
+    except:
+        print('failed to read Terraform state', file=sys.stderr)
+        sys.exit(1)
+    else:
+        print_state_rm_commands(state, pattern)
+
+def main():
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers()
+
+    export = subparsers.add_parser('export')
+    export.add_argument('pattern', metavar='PATTERN',
+            help='pattern to match')
+    export.set_defaults(handler=do_export)
+
+    forget = subparsers.add_parser('forget')
+    forget.add_argument('pattern', metavar='PATTERN',
+            help='pattern to match')
+    forget.set_defaults(handler=do_forget)
+
+    args = parser.parse_args()
+    try:
+        handler = args.handler
+    except AttributeError:
+        parser.print_usage()
+    else:
+        handler(args)
+
+if __name__ == '__main__':
+    main()
+
